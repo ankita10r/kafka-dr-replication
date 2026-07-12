@@ -1,0 +1,16 @@
+# Gradle
+producer/build/
+producer/.gradle/
+**/build/
+**/.gradle/
+
+# IntelliJ
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Logs
+*.log
