@@ -1,6 +1,6 @@
 # Kafka DR Replication Project
 
-> **Status: Task 1 of 3 complete.**
+> **Status: Tasks 1 & 2 of 3 complete.**
 
 A disaster-recovery replication pipeline for Kafka: a synthetic event
 producer, a fault-tolerance patch for MirrorMaker 2, and the Docker
@@ -12,13 +12,19 @@ I split this into three tasks and I'm verifying each one before moving to
 the next.
 
 1. **Fake-data generator** — Java CLI, `--count N` produces exactly N fake
-   JSON commit-log events to the primary cluster. **✅ Done.**
+   JSON commit-log events to the primary cluster. **✅ Done** — see
+   [`producer/README.md`](producer/README.md).
 2. **Patch MirrorMaker 2** — fork Kafka, add a fail-fast rule for silent
-   truncation and a self-healing rule for topic delete/recreate. **⬜ Not
-   started.**
+   truncation and a self-healing rule for topic delete/recreate. **✅
+   Done, verified against a real two-cluster Docker stack** — see
+   [`mm2-patch/README.md`](mm2-patch/README.md).
 3. **Automate and package** — Docker Hub images, `docker-compose.yml`,
-   `run_challenge.sh`, final README. **⬜ Not started** beyond an unverified
-   compose draft.
+   `run_challenge.sh`, final README. **⬜ Not started** — verification
+   happened, but `docker/` and `scripts/` aren't committed to this repo
+   yet (coming next).
+
+Full design reasoning and every real bug found along the way lives in
+[`docs/DESIGN.md`](docs/DESIGN.md).
 
 ---
 
@@ -32,110 +38,62 @@ the next.
 
 ## 2. Docker Hub images
 
-Not published yet — `producer/Dockerfile` is buildable but unpushed;
-the MM2 image is blocked on Task 2/3.
+Not published yet — `producer/Dockerfile` is buildable but unpushed; the
+MM2 image builds successfully (verified locally via Docker Compose) but
+hasn't been pushed to a registry.
 
-## 3. Task 1 — Commit Log Producer
+## 3. Setup & test execution
 
-Java/Gradle CLI, built test-first. Source: [`producer/`](producer/).
+Per-task setup, test commands, and manual verification steps:
 
-**Schema produced:**
-```json
-{
-  "event_id": "a8a1c867-05c3-4d43-9884-f7b55f1f0a7c",
-  "timestamp": 1724684407,
-  "op_type": "UPDATE",
-  "key": "doc:8f7b",
-  "value": { "status": "archived" }
-}
-```
+- **Task 1 (producer):** [`producer/README.md`](producer/README.md)
+- **Task 2 (MM2 patch):** [`mm2-patch/README.md`](mm2-patch/README.md)
+- **Full 3-scenario walkthrough:** [`docs/MANUAL_TESTING.md`](docs/MANUAL_TESTING.md)
 
-### Setup
-```bash
-cd producer
-./gradlew build
-```
+## 4. Log analysis
 
-### Test execution
-```bash
-cd producer
-./gradlew test
-```
-20 tests, 4 classes, all passing, no broker needed — send-loop tests use
-Kafka's `MockProducer`. Report: `producer/build/reports/tests/test/index.html`
+Covered per-task in the docs linked above — the key lines to watch for are
+`Detected unrecoverable data loss` (truncation) and `Detected topic reset`
+(self-healing), both in MM2's logs.
 
-### Manual verification against a real local broker
+---
 
-I also ran this against an actual Kafka container to confirm the wiring
-(bootstrap address, serializers) works, not just the mocked logic:
-
-```bash
-# one-off broker
-docker run -d --rm --name kafka-quick -p 9092:9092 \
-  -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
-  -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
-  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
-  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
-  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
-  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
-  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
-  apache/kafka:4.0.0
-
-# run the producer against it
-./gradlew run --args="--count 10 --bootstrap-servers localhost:9092 --topic commit-log"
-
-# confirm the messages actually landed
-docker exec -it kafka-quick /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic commit-log --from-beginning --max-messages 10
-
-# clean up
-docker stop kafka-quick
-```
-
-### Log analysis
-
-- `Starting CommitLogProducer: topic=..., count=..., bootstrap=...` on startup
-- `Produced N/count messages (last offset=..., partition=...)` every 100 messages
-- `Failed to send message ... (event_id=...)` at ERROR — only on a real send failure, immediately followed by the process throwing and stopping
-
-### Design rationale
-
-- Event generation (`EventGenerator`/`EventJsonMapper`) is kept separate from
-  Kafka I/O so the send loop is unit-testable with `MockProducer` instead of
-  needing a live broker for every run.
-- `--count` has no default — it's required by the assignment, so a silent
-  default would hide a usage mistake.
-- Send failures throw and stop rather than log-and-continue — the spec asks
-  for exactly `--count` messages; silently under-delivering would defeat
-  that.
-- `acks=all` + idempotence on, since this producer is modeling a
-  write-ahead log and durability mattered more than throughput here.
-
-
-
-### AI usage
-*(This is a running list for Task 1 only, will be updated as I code.)*
+## AI usage
 
 I used Claude to help structure and build this, and cross-checked some of
 its suggestions with Gemini before accepting them, particularly on design
 tradeoffs.
 
-- Used it to turn my high-level idea into an ordered plan — splitting the assignment into the three tasks above.
-- Helped with the Docker/Compose setup.
-- Helped me get local Kafka running and test against it from IntelliJ.
-- Helped tighten commit messages and this README's wording.
-- Helped design test cases per task to keep this TDD.
+**General, across both tasks:**
+- Used it to turn my high-level idea into an ordered plan — splitting the
+  assignment into the three tasks above.
+- I'd assumed the PR alone was the deliverable; it pointed out the README
+  also needs the fork link.
+- Helped with the Docker/Compose setup and local Kafka testing from
+  IntelliJ.
+- Helped design test cases per task to keep this TDD, and tightened
+  commit messages and README wording.
+- Modified an early, crudely-written README into a proper one.
 - Used Gemini separately to sanity-check some of the above rather than
   taking one tool's output as final.
+
+**Task 2 specific** (full list in [`mm2-patch/README.md`](mm2-patch/README.md)):
+- Explained why `.patch` files, not raw `.java`, are the right way to
+  submit fork changes, and why two separate repos (fork vs. submission)
+  are needed.
+- Helped with git steps for checking out the correct Kafka version
+  (`4.0.0` tag) and branch naming.
+- For this task, AI wrote the patch files more directly than Task 1's
+  code — I verified correctness by running it against a real cluster,
+  where we found and fixed three real bugs together.
 
 ---
 
 ## Roadmap
 
-- [ ] Apply MM2 patch to the Kafka fork, verify it compiles
-- [ ] Docker Compose end-to-end
+- [x] Apply MM2 patch to the Kafka fork, verify it compiles
+- [x] Run all three test scenarios against the real cluster
+- [ ] Commit `docker/` and `scripts/run_challenge.sh` to this repo
 - [ ] Push both Docker Hub images
-- [ ] `run_challenge.sh`
-- [ ] Run all three test scenarios against the real cluster
 - [ ] Open the PR
 - [ ] Fill in links above
