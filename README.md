@@ -80,7 +80,7 @@ tradeoffs.
   where we found and fixed three real bugs together.
 
 **Task 3 specific:**
---Helped debug and fix the code through manual testing of all three scenarios before the 
+- Helped debug and fix the code through manual testing of all three scenarios before the 
 automation script was written — that's where the three real bugs actually surfaced and got fixed.
 - Wrote the file `run_challenge.sh`, since I'm not confident
   with bash — I ran it and confirmed the 6/6 pass result myself.
