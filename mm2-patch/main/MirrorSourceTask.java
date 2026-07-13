@@ -45,6 +45,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -73,6 +74,9 @@ public class MirrorSourceTask extends SourceTask {
     private Admin sourceAdmin;
     private final Map<String, Uuid> knownTopicIds = new HashMap<>();
     private final ReplicationFailureClassifier failureClassifier = new ReplicationFailureClassifier();
+    // Key under which we piggyback the topic UUID onto Connect's own per-partition
+    // offset commit, so it survives task/container restarts (see loadKnownTopicId).
+    private static final String TOPIC_ID_OFFSET_KEY = "mm2_fault_tolerance_topic_id";
     // -------------------------------------------------------------------------
 
     public MirrorSourceTask() {}
@@ -121,11 +125,17 @@ public class MirrorSourceTask extends SourceTask {
         }
 
         Set<TopicPartition> taskTopicPartitions = config.taskTopicPartitions();
-        initializeConsumer(taskTopicPartitions);
-        primeKnownTopicIds(taskTopicPartitions);
+        // Check topic identity BEFORE seeking to any stored offset -- if we only relied on
+        // OffsetOutOfRangeException firing reactively, a reset where the old committed offset
+        // happens to still be a numerically valid position in the recreated topic (e.g. both
+        // incarnations happened to have a similar message count) would seek "successfully" and
+        // silently stall, with no exception ever thrown at all. See DESIGN.md for the real
+        // incident this fixes.
+        Set<TopicPartition> preexistingResets = primeKnownTopicIdsAndDetectResets(taskTopicPartitions);
+        initializeConsumer(taskTopicPartitions, preexistingResets);
 
         log.info("{} replicating {} topic-partitions {}->{}: {}.", Thread.currentThread().getName(),
-            taskTopicPartitions.size(), sourceClusterAlias, config.targetClusterAlias(), taskTopicPartitions);
+                taskTopicPartitions.size(), sourceClusterAlias, config.targetClusterAlias(), taskTopicPartitions);
     }
 
     @Override
@@ -149,7 +159,7 @@ public class MirrorSourceTask extends SourceTask {
         try {
             consumerAccess.acquire();
         } catch (InterruptedException e) {
-            log.warn("Interrupted waiting for access to consumer. Will try closing anyway."); 
+            log.warn("Interrupted waiting for access to consumer. Will try closing anyway.");
         }
         Utils.closeQuietly(consumer, "source consumer");
         Utils.closeQuietly(sourceAdmin, "source admin client");
@@ -157,7 +167,7 @@ public class MirrorSourceTask extends SourceTask {
         Utils.closeQuietly(metrics, "metrics");
         log.info("Stopping {} took {} ms.", Thread.currentThread().getName(), System.currentTimeMillis() - start);
     }
-   
+
     @Override
     public String version() {
         return new MirrorSourceConnector().version();
@@ -220,7 +230,7 @@ public class MirrorSourceTask extends SourceTask {
             consumerAccess.release();
         }
     }
- 
+
     @Override
     public void commitRecord(SourceRecord record, RecordMetadata metadata) {
         if (stopping) {
@@ -251,10 +261,39 @@ public class MirrorSourceTask extends SourceTask {
 
     // --- Fault-tolerance additions -------------------------------------------------------
 
-    /** Caches each assigned topic's current UUID so future resets (recreate) can be detected. */
-    private void primeKnownTopicIds(Set<TopicPartition> topicPartitions) {
-        Set<String> topics = topicPartitions.stream().map(TopicPartition::topic).collect(Collectors.toSet());
-        fetchTopicIds(topics).forEach(knownTopicIds::put);
+    /**
+     * Runs once at task startup, before any consumer seeking happens. For every assigned
+     * partition, loads the durably-stored topic ID from the last commit (if any) and always
+     * fetches the topic's current ID live. Returns the set of partitions whose topic was reset
+     * while this task wasn't running, so {@link #initializeConsumer} can seek them to the
+     * beginning immediately instead of seeking to a stale numeric offset and hoping an exception
+     * surfaces the problem later -- which, if that stale offset happens to still be a valid
+     * position in the new topic's log, it never will.
+     */
+    private Set<TopicPartition> primeKnownTopicIdsAndDetectResets(Set<TopicPartition> topicPartitions) {
+        Set<String> allTopics = topicPartitions.stream().map(TopicPartition::topic).collect(Collectors.toSet());
+        Map<String, Uuid> currentIds = fetchTopicIds(allTopics);
+
+        Set<TopicPartition> resetPartitions = new HashSet<>();
+        for (TopicPartition tp : topicPartitions) {
+            Uuid durable = loadKnownTopicId(tp);
+            Uuid current = currentIds.get(tp.topic());
+
+            if (durable != null
+                    && failureClassifier.classify(durable, current) == ReplicationFailureClassifier.Decision.TOPIC_RESET) {
+                log.warn("Detected topic reset for {} at startup, before seeking to any stored offset: "
+                        + "topic ID changed from {} to {}. Resubscribing from the beginning instead "
+                        + "of the previously committed offset.", tp, durable, current);
+                resetPartitions.add(tp);
+            }
+            // Cache whichever ID is authoritative going forward: the freshly-fetched current one
+            // if we got it, otherwise fall back to the durable value (better than nothing).
+            Uuid toCache = current != null ? current : durable;
+            if (toCache != null) {
+                knownTopicIds.put(tp.topic(), toCache);
+            }
+        }
+        return resetPartitions;
     }
 
     private Map<String, Uuid> fetchTopicIds(Set<String> topics) {
@@ -349,14 +388,56 @@ public class MirrorSourceTask extends SourceTask {
         return MirrorUtils.unwrapOffset(wrappedOffset);
     }
 
-    // visible for testing
+    /**
+     * Reads back the topic UUID we last stamped onto this partition's committed offset (see
+     * {@link #convertRecord}), if any. This is what makes reset-detection durable across task
+     * or container restarts: {@link #knownTopicIds} alone is in-memory only and starts empty on
+     * every restart, which would make a topic recreated <i>before</i> a restart indistinguishable
+     * from one that was never recreated at all -- both would look like "no prior ID cached, just
+     * fetch the current one," losing the very comparison the whole feature depends on. Connect's
+     * offset storage is durable (backed by its own internal topic), so reading the UUID back from
+     * there instead of trusting only the in-memory cache closes that gap.
+     */
+    private Uuid loadKnownTopicId(TopicPartition topicPartition) {
+        Map<String, Object> wrappedPartition = MirrorUtils.wrapPartition(topicPartition, sourceClusterAlias);
+        Map<String, Object> wrappedOffset = context.offsetStorageReader().offset(wrappedPartition);
+        if (wrappedOffset == null) {
+            return null;
+        }
+        Object stored = wrappedOffset.get(TOPIC_ID_OFFSET_KEY);
+        if (stored == null) {
+            return null;
+        }
+        try {
+            return Uuid.fromString(stored.toString());
+        } catch (IllegalArgumentException e) {
+            log.warn("Could not parse stored topic ID '{}' for {}; treating as unknown.", stored, topicPartition, e);
+            return null;
+        }
+    }
+
+    // visible for testing -- kept for backward compatibility with Kafka's own existing
+    // MirrorSourceTaskTest#testSeekBehaviorDuringStart, which calls this exact signature.
     void initializeConsumer(Set<TopicPartition> taskTopicPartitions) {
+        initializeConsumer(taskTopicPartitions, Collections.emptySet());
+    }
+
+    // visible for testing
+    void initializeConsumer(Set<TopicPartition> taskTopicPartitions, Set<TopicPartition> resetPartitions) {
         Map<TopicPartition, Long> topicPartitionOffsets = loadOffsets(taskTopicPartitions);
         consumer.assign(topicPartitionOffsets.keySet());
         log.info("Starting with {} previously uncommitted partitions.", topicPartitionOffsets.values().stream()
                 .filter(this::isUncommitted).count());
 
         topicPartitionOffsets.forEach((topicPartition, offset) -> {
+            if (resetPartitions.contains(topicPartition)) {
+                // A reset was already detected for this partition before we got here (see
+                // primeKnownTopicIdsAndDetectResets) -- seek to the beginning of the new topic
+                // rather than to the old, now-meaningless numeric offset.
+                log.trace("Seeking {} to the beginning due to a topic reset detected at startup.", topicPartition);
+                consumer.seekToBeginning(Collections.singletonList(topicPartition));
+                return;
+            }
             // Do not call seek on partitions that don't have an existing offset committed.
             if (isUncommitted(offset)) {
                 log.trace("Skipping seeking offset for topicPartition: {}", topicPartition);
@@ -368,13 +449,22 @@ public class MirrorSourceTask extends SourceTask {
         });
     }
 
-    // visible for testing 
+    // visible for testing
     SourceRecord convertRecord(ConsumerRecord<byte[], byte[]> record) {
         String targetTopic = formatRemoteTopic(record.topic());
         Headers headers = convertHeaders(record);
+
+        // Piggyback the topic's current known UUID onto the offset we're about to commit --
+        // see loadKnownTopicId for why this needs to be durable, not just cached in memory.
+        Map<String, Object> sourceOffset = new HashMap<>(MirrorUtils.wrapOffset(record.offset()));
+        Uuid currentTopicId = knownTopicIds.get(record.topic());
+        if (currentTopicId != null) {
+            sourceOffset.put(TOPIC_ID_OFFSET_KEY, currentTopicId.toString());
+        }
+
         return new SourceRecord(
                 MirrorUtils.wrapPartition(new TopicPartition(record.topic(), record.partition()), sourceClusterAlias),
-                MirrorUtils.wrapOffset(record.offset()),
+                sourceOffset,
                 targetTopic, record.partition(),
                 Schema.OPTIONAL_BYTES_SCHEMA, record.key(),
                 Schema.BYTES_SCHEMA, record.value(),

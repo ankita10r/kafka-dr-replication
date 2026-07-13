@@ -12,9 +12,3 @@ Two different things live in this folder, for two different purposes:
   compile and test run happens inside the fork, after the patches are
   applied there:
 
-```bash
-./gradlew :connect:mirror:compileJava
-./gradlew :connect:mirror:test --tests "org.apache.kafka.connect.mirror.ReplicationFailureClassifierTest"
-```
-
-See `docs/DESIGN.md` for the full reasoning.
