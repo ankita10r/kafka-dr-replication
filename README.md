@@ -69,6 +69,11 @@ tradeoffs.
   IntelliJ.
 - Helped design test cases per task to keep this TDD, and tightened
   commit messages and README wording.
+- Modified an early, crudely-written README into a proper one.
+- I wrote Task 1's code myself, based on my own understanding, without
+  using IntelliJ's built-in AI assistance — Claude's role there was
+  auditing what I wrote, verifying it, and filling gaps in my logic and
+  structure, not writing it from scratch.
 - Used Gemini separately to sanity-check some of the above rather than
   taking one tool's output as final.
 
