@@ -5,7 +5,7 @@ index 6ab65be..e05a995 100644
 @@ -16,12 +16,18 @@
   */
  package org.apache.kafka.connect.mirror;
-
+ 
 +import org.apache.kafka.clients.admin.Admin;
 +import org.apache.kafka.clients.admin.TopicDescription;
 +import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -23,7 +23,7 @@ index 6ab65be..e05a995 100644
  import org.apache.kafka.common.utils.Utils;
 @@ -35,10 +41,15 @@ import org.slf4j.Logger;
  import org.slf4j.LoggerFactory;
-
+ 
  import java.time.Duration;
 +import java.time.Instant;
  import java.util.ArrayList;
@@ -36,11 +36,11 @@ index 6ab65be..e05a995 100644
 +import java.util.concurrent.ExecutionException;
  import java.util.concurrent.Semaphore;
  import java.util.stream.Collectors;
-
+ 
 @@ -56,6 +67,18 @@ public class MirrorSourceTask extends SourceTask {
      private Semaphore consumerAccess;
      private OffsetSyncWriter offsetSyncWriter;
-
+ 
 +    // --- Fault-tolerance additions -----------------------------------------
 +    // Admin client used purely to fetch each source topic's UUID, which lets us
 +    // tell a genuine delete+recreate (topic ID changes) apart from ordinary
@@ -54,12 +54,12 @@ index 6ab65be..e05a995 100644
 +    // -------------------------------------------------------------------------
 +
      public MirrorSourceTask() {}
-
+ 
      // for testing
 @@ -70,6 +93,13 @@ public class MirrorSourceTask extends SourceTask {
          this.offsetSyncWriter = offsetSyncWriter;
      }
-
+ 
 +    // for testing
 +    MirrorSourceTask(KafkaConsumer<byte[], byte[]> consumer, MirrorSourceMetrics metrics, String sourceClusterAlias,
 +                     ReplicationPolicy replicationPolicy, OffsetSyncWriter offsetSyncWriter, Admin sourceAdmin) {
@@ -98,11 +98,11 @@ index 6ab65be..e05a995 100644
 +        // incident this fixes.
 +        Set<TopicPartition> preexistingResets = primeKnownTopicIdsAndDetectResets(taskTopicPartitions);
 +        initializeConsumer(taskTopicPartitions, preexistingResets);
-
+ 
          log.info("{} replicating {} topic-partitions {}->{}: {}.", Thread.currentThread().getName(),
              taskTopicPartitions.size(), sourceClusterAlias, config.targetClusterAlias(), taskTopicPartitions);
 @@ -113,6 +162,7 @@ public class MirrorSourceTask extends SourceTask {
-             log.warn("Interrupted waiting for access to consumer. Will try closing anyway.");
+             log.warn("Interrupted waiting for access to consumer. Will try closing anyway."); 
          }
          Utils.closeQuietly(consumer, "source consumer");
 +        Utils.closeQuietly(sourceAdmin, "source admin client");
@@ -139,7 +139,7 @@ index 6ab65be..e05a995 100644
              offsetSyncWriter.firePendingOffsetSyncs();
          }
      }
--
+- 
 +
 +    // --- Fault-tolerance additions -------------------------------------------------------
 +
@@ -266,7 +266,7 @@ index 6ab65be..e05a995 100644
 @@ -200,14 +388,56 @@ public class MirrorSourceTask extends SourceTask {
          return MirrorUtils.unwrapOffset(wrappedOffset);
      }
-
+ 
 -    // visible for testing
 +    /**
 +     * Reads back the topic UUID we last stamped onto this partition's committed offset (see
@@ -308,7 +308,7 @@ index 6ab65be..e05a995 100644
          consumer.assign(topicPartitionOffsets.keySet());
          log.info("Starting with {} previously uncommitted partitions.", topicPartitionOffsets.values().stream()
                  .filter(this::isUncommitted).count());
-
+ 
          topicPartitionOffsets.forEach((topicPartition, offset) -> {
 +            if (resetPartitions.contains(topicPartition)) {
 +                // A reset was already detected for this partition before we got here (see
