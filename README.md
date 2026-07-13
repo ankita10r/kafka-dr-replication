@@ -1,6 +1,6 @@
 # Kafka DR Replication Project
 
-> **Status: All 3 tasks verified and committed. Docker Hub push and PR still pending.**
+> **Status: All 3 tasks complete. PR open against apache/kafka.**
 
 A disaster-recovery replication pipeline for Kafka: a synthetic event
 producer, a fault-tolerance patch for MirrorMaker 2, and the Docker
@@ -15,13 +15,12 @@ environment to run both end-to-end.
    truncation and a self-healing rule for topic delete/recreate. **✅
    Done, verified against a real two-cluster Docker stack** — see
    [`mm2-patch/README.md`](mm2-patch/README.md).
-3. **Automate and package** — Docker Compose stack + `run_challenge.sh`.
-   **✅ Done, 6/6 scenarios passing** — see
-   [`scripts/README.md`](scripts/README.md). Docker Hub images and the PR
-   are the remaining deliverables (see Roadmap).
+3. **Automate and package** — Docker Compose stack, `run_challenge.sh`,
+   Docker Hub images. **✅ Done, 6/6 scenarios passing** — see
+   [`scripts/README.md`](scripts/README.md).
 
-Full design reasoning and every real bug found along the way lives in
-[`docs/DESIGN.md`](docs/DESIGN.md).
+Full design reasoning, including three real bugs found and fixed via
+testing, is in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ---
 
@@ -30,13 +29,15 @@ Full design reasoning and every real bug found along the way lives in
 | What | Link |
 |---|---|
 | This repo | you're in it |
-| Kafka fork (Tasks 2/3) | not yet pushed |
-| PR against `apache/kafka` | not opened yet |
+| Kafka fork | https://github.com/ankita10r/kafka, branch `feature/mm2-fault-tolerance` |
+| Pull request against `apache/kafka` | https://github.com/apache/kafka/pull/22819 |
 
 ## 2. Docker Hub images
 
-Not published yet — both images build and run successfully locally
-(verified via `run_challenge.sh`), not yet pushed to a registry.
+| Image | Link |
+|---|---|
+| Enhanced MirrorMaker 2 | [ankitafynarfin/mm2-enhanced](https://hub.docker.com/r/ankitafynarfin/mm2-enhanced) |
+| Commit Log Producer | [ankitafynarfin/commit-log-producer](https://hub.docker.com/r/ankitafynarfin/commit-log-producer) |
 
 ## 3. Setup & test execution
 
@@ -78,12 +79,19 @@ tradeoffs.
 - For this task, AI wrote the patch files more directly than Task 1's
   code — I verified correctness by running it against a real cluster,
   where we found and fixed three real bugs together.
+- Helped debug and fix the code through manual testing of all three
+  scenarios before the automation script was written — that's where the
+  three real bugs actually surfaced and got fixed.
 
 **Task 3 specific:**
-- Helped debug and fix the code through manual testing of all three scenarios before the 
-automation script was written — that's where the three real bugs actually surfaced and got fixed.
-- Wrote the file `run_challenge.sh`, since I'm not confident
+- Wrote the first draft of `run_challenge.sh`, since I'm not confident
   with bash — I ran it and confirmed the 6/6 pass result myself.
+
+**Getting the PR open:**
+- Helped untangle a local git issue (a corrupted clone, then a squashed
+  commit history, then a wrong-commit cherry-pick) that came up while
+  rebasing onto the current `4.0` branch before the PR could be opened
+  cleanly.
 
 ---
 
@@ -92,6 +100,5 @@ automation script was written — that's where the three real bugs actually surf
 - [x] Apply MM2 patch to the Kafka fork, verify it compiles
 - [x] Run all three test scenarios against the real cluster
 - [x] Commit `docker/` and `scripts/run_challenge.sh` to this repo
-- [ ] Push both Docker Hub images
-- [ ] Open the PR
-- [ ] Fill in links above
+- [x] Push both Docker Hub images
+- [x] Open the PR
