@@ -1,0 +1,225 @@
+diff --git a/connect/mirror/src/main/java/org/apache/kafka/connect/mirror/MirrorSourceTask.java b/connect/mirror/src/main/java/org/apache/kafka/connect/mirror/MirrorSourceTask.java
+index 6ab65be..6165ba2 100644
+--- a/connect/mirror/src/main/java/org/apache/kafka/connect/mirror/MirrorSourceTask.java
++++ b/connect/mirror/src/main/java/org/apache/kafka/connect/mirror/MirrorSourceTask.java
+@@ -16,12 +16,18 @@
+  */
+ package org.apache.kafka.connect.mirror;
+ 
++import org.apache.kafka.clients.admin.Admin;
++import org.apache.kafka.clients.admin.TopicDescription;
++import org.apache.kafka.clients.consumer.ConsumerConfig;
+ import org.apache.kafka.clients.consumer.ConsumerRecord;
+ import org.apache.kafka.clients.consumer.ConsumerRecords;
+ import org.apache.kafka.clients.consumer.KafkaConsumer;
++import org.apache.kafka.clients.consumer.NoOffsetForPartitionException;
++import org.apache.kafka.clients.consumer.OffsetOutOfRangeException;
+ import org.apache.kafka.clients.producer.RecordMetadata;
+ import org.apache.kafka.common.KafkaException;
+ import org.apache.kafka.common.TopicPartition;
++import org.apache.kafka.common.Uuid;
+ import org.apache.kafka.common.errors.WakeupException;
+ import org.apache.kafka.common.header.Header;
+ import org.apache.kafka.common.utils.Utils;
+@@ -35,10 +41,14 @@ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import java.time.Duration;
++import java.time.Instant;
+ import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Semaphore;
+ import java.util.stream.Collectors;
+ 
+@@ -56,6 +66,15 @@ public class MirrorSourceTask extends SourceTask {
+     private Semaphore consumerAccess;
+     private OffsetSyncWriter offsetSyncWriter;
+ 
++    // --- Fault-tolerance additions -----------------------------------------
++    // Admin client used purely to fetch each source topic's UUID, which lets us
++    // tell a genuine delete+recreate (topic ID changes) apart from ordinary
++    // retention-based truncation (topic ID stays the same, only old offsets vanish).
++    private Admin sourceAdmin;
++    private final Map<String, Uuid> knownTopicIds = new HashMap<>();
++    private final ReplicationFailureClassifier failureClassifier = new ReplicationFailureClassifier();
++    // -------------------------------------------------------------------------
++
+     public MirrorSourceTask() {}
+ 
+     // for testing
+@@ -70,6 +89,13 @@ public class MirrorSourceTask extends SourceTask {
+         this.offsetSyncWriter = offsetSyncWriter;
+     }
+ 
++    // for testing
++    MirrorSourceTask(KafkaConsumer<byte[], byte[]> consumer, MirrorSourceMetrics metrics, String sourceClusterAlias,
++                     ReplicationPolicy replicationPolicy, OffsetSyncWriter offsetSyncWriter, Admin sourceAdmin) {
++        this(consumer, metrics, sourceClusterAlias, replicationPolicy, offsetSyncWriter);
++        this.sourceAdmin = sourceAdmin;
++    }
++
+     @Override
+     public void start(Map<String, String> props) {
+         MirrorSourceTaskConfig config = new MirrorSourceTaskConfig(props);
+@@ -81,9 +107,22 @@ public class MirrorSourceTask extends SourceTask {
+         if (config.emitOffsetSyncsEnabled()) {
+             offsetSyncWriter = new OffsetSyncWriter(config);
+         }
+-        consumer = MirrorUtils.newConsumer(config.sourceConsumerConfig("replication-consumer"));
++
++        // Force explicit truncation detection: with the default "earliest", a consumer
++        // whose next offset has been purged by retention would silently jump forward and
++        // the resulting gap would never be reported. "none" makes the consumer throw
++        // OffsetOutOfRangeException instead, which we handle explicitly below.
++        Map<String, Object> consumerConfig = config.sourceConsumerConfig("replication-consumer");
++        consumerConfig.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none");
++        consumer = MirrorUtils.newConsumer(consumerConfig);
++
++        if (sourceAdmin == null) {
++            sourceAdmin = Admin.create(config.sourceAdminConfig("fault-tolerance-admin"));
++        }
++
+         Set<TopicPartition> taskTopicPartitions = config.taskTopicPartitions();
+         initializeConsumer(taskTopicPartitions);
++        primeKnownTopicIds(taskTopicPartitions);
+ 
+         log.info("{} replicating {} topic-partitions {}->{}: {}.", Thread.currentThread().getName(),
+             taskTopicPartitions.size(), sourceClusterAlias, config.targetClusterAlias(), taskTopicPartitions);
+@@ -113,6 +152,7 @@ public class MirrorSourceTask extends SourceTask {
+             log.warn("Interrupted waiting for access to consumer. Will try closing anyway."); 
+         }
+         Utils.closeQuietly(consumer, "source consumer");
++        Utils.closeQuietly(sourceAdmin, "source admin client");
+         Utils.closeQuietly(offsetSyncWriter, "offset sync writer");
+         Utils.closeQuietly(metrics, "metrics");
+         log.info("Stopping {} took {} ms.", Thread.currentThread().getName(), System.currentTimeMillis() - start);
+@@ -148,6 +188,25 @@ public class MirrorSourceTask extends SourceTask {
+                 log.trace("Polled {} records from {}.", sourceRecords.size(), records.partitions());
+                 return sourceRecords;
+             }
++        } catch (NoOffsetForPartitionException e) {
++            // No committed offset exists yet for these partitions, and auto.offset.reset=none
++            // gives no default to fall back on. This is expected the first time MM2 ever
++            // replicates a partition -- nothing has been produced through this pipeline yet,
++            // so there's nothing to have lost. Vanilla MM2 (default auto.offset.reset=earliest)
++            // would have silently started from the beginning here; we do the same thing
++            // explicitly instead of leaving it to a config default, and log it so it's visible
++            // in the logs that this was a first-run start, not a swallowed error.
++            log.info("No previously committed offset for {} -- first replication run for "
++                    + "these partitions. Starting from the beginning.", e.partitions());
++            consumer.seekToBeginning(e.partitions());
++            return null;
++        } catch (OffsetOutOfRangeException e) {
++            // Either (a) retention purged data we hadn't replicated yet [truncation -> fail
++            // fast], or (b) the topic was deleted and recreated [reset -> resubscribe from
++            // the beginning]. handleOffsetOutOfRange tells the two apart and throws
++            // MirrorDataLossException itself for case (a).
++            handleOffsetOutOfRange(e);
++            return null;
+         } catch (WakeupException e) {
+             return null;
+         } catch (KafkaException e) {
+@@ -189,7 +248,97 @@ public class MirrorSourceTask extends SourceTask {
+             offsetSyncWriter.firePendingOffsetSyncs();
+         }
+     }
+- 
++
++    // --- Fault-tolerance additions -------------------------------------------------------
++
++    /** Caches each assigned topic's current UUID so future resets (recreate) can be detected. */
++    private void primeKnownTopicIds(Set<TopicPartition> topicPartitions) {
++        Set<String> topics = topicPartitions.stream().map(TopicPartition::topic).collect(Collectors.toSet());
++        fetchTopicIds(topics).forEach(knownTopicIds::put);
++    }
++
++    private Map<String, Uuid> fetchTopicIds(Set<String> topics) {
++        Map<String, Uuid> result = new HashMap<>();
++        if (topics.isEmpty()) {
++            return result;
++        }
++        try {
++            Map<String, org.apache.kafka.common.KafkaFuture<TopicDescription>> futures =
++                    sourceAdmin.describeTopics(topics).topicNameValues();
++            for (Map.Entry<String, org.apache.kafka.common.KafkaFuture<TopicDescription>> entry : futures.entrySet()) {
++                try {
++                    result.put(entry.getKey(), entry.getValue().get().topicId());
++                } catch (ExecutionException | InterruptedException e) {
++                    log.warn("Could not fetch topic ID for {} while checking for topic reset.", entry.getKey(), e);
++                }
++            }
++        } catch (KafkaException e) {
++            log.warn("Could not describe topics {} while checking for topic reset.", topics, e);
++        }
++        return result;
++    }
++
++    /**
++     * Distinguishes truncation from a topic delete+recreate for every partition named in the
++     * exception, and either fails fast (truncation) or resubscribes from the beginning (reset).
++     * The actual classification decision is delegated to {@link ReplicationFailureClassifier}
++     * (unit-tested in isolation) -- this method owns the I/O and side effects around that
++     * decision (fetching UUIDs, logging, seeking, throwing).
++     */
++    private void handleOffsetOutOfRange(OffsetOutOfRangeException e) {
++        Set<TopicPartition> affected = e.offsetOutOfRangePartitions().keySet();
++        Set<String> affectedTopics = affected.stream().map(TopicPartition::topic).collect(Collectors.toSet());
++        Map<String, Uuid> currentTopicIds = fetchTopicIds(affectedTopics);
++
++        List<TopicPartition> resetPartitions = new ArrayList<>();
++
++        for (TopicPartition tp : affected) {
++            long requestedOffset = e.offsetOutOfRangePartitions().get(tp);
++            Uuid previousId = knownTopicIds.get(tp.topic());
++            Uuid currentId = currentTopicIds.get(tp.topic());
++
++            ReplicationFailureClassifier.Decision decision = failureClassifier.classify(previousId, currentId);
++
++            if (decision == ReplicationFailureClassifier.Decision.TOPIC_RESET) {
++                log.warn("Detected topic reset for {}-{}: topic ID changed from {} to {} "
++                                + "(topic was deleted and recreated) at {}. Resubscribing from the beginning offset.",
++                        tp.topic(), tp.partition(), previousId, currentId, Instant.now());
++                resetPartitions.add(tp);
++                knownTopicIds.put(tp.topic(), currentId);
++            } else {
++                // Same topic identity, or we couldn't establish one/both IDs: the offset we
++                // needed is simply gone and we can't prove this was a benign reset. That's an
++                // undetected replication gap -- fail fast rather than silently skip ahead.
++                long earliest = safeBeginningOffset(tp);
++                log.error("Detected unrecoverable data loss for {}-{}: next required offset {} is no longer "
++                                + "available on the source cluster (earliest available offset is now {}). "
++                                + "This indicates retention purged data before it was replicated. Failing fast.",
++                        tp.topic(), tp.partition(), requestedOffset, earliest);
++                throw new MirrorDataLossException(String.format(
++                        "Data loss detected on %s-%s: required offset %d but earliest available is %d. "
++                                + "Data was purged by retention before MirrorMaker 2 replicated it.",
++                        tp.topic(), tp.partition(), requestedOffset, earliest));
++            }
++        }
++
++        if (!resetPartitions.isEmpty()) {
++            consumer.seekToBeginning(resetPartitions);
++        }
++    }
++
++    private long safeBeginningOffset(TopicPartition tp) {
++        try {
++            Map<TopicPartition, Long> beginning = consumer.beginningOffsets(Collections.singletonList(tp));
++            Long offset = beginning.get(tp);
++            return offset == null ? -1L : offset;
++        } catch (KafkaException e) {
++            log.warn("Could not fetch beginning offset for {} while reporting data loss.", tp, e);
++            return -1L;
++        }
++    }
++
++    // ---------------------------------------------------------------------------------------
++
+     private Map<TopicPartition, Long> loadOffsets(Set<TopicPartition> topicPartitions) {
+         return topicPartitions.stream().collect(Collectors.toMap(x -> x, this::loadOffset));
+     }

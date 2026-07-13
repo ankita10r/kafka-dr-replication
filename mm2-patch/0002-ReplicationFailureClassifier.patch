@@ -1,0 +1,62 @@
+diff --git a/connect/mirror/src/main/java/org/apache/kafka/connect/mirror/ReplicationFailureClassifier.java b/connect/mirror/src/main/java/org/apache/kafka/connect/mirror/ReplicationFailureClassifier.java
+new file mode 100644
+index 0000000..1c6a8da
+--- /dev/null
++++ b/connect/mirror/src/main/java/org/apache/kafka/connect/mirror/ReplicationFailureClassifier.java
+@@ -0,0 +1,56 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.kafka.connect.mirror;
++
++import org.apache.kafka.common.Uuid;
++
++/**
++ * Decides whether an {@code OffsetOutOfRangeException} represents a genuine data-loss
++ * event (retention purged data MirrorMaker 2 hadn't replicated yet) or a benign topic
++ * reset (the topic was deleted and recreated), based on whether the topic's UUID has
++ * changed since it was last observed.
++ *
++ * <p>Deliberately free of any Kafka Connect, consumer, or AdminClient dependency --
++ * takes two {@link Uuid} values in, returns a decision out. This is what makes it
++ * unit-testable without a broker (see {@code ReplicationFailureClassifierTest}); all
++ * the I/O (fetching the current UUID, caching the previous one, acting on the
++ * decision) stays in {@link MirrorSourceTask}.
++ */
++public class ReplicationFailureClassifier {
++
++    public enum Decision {
++        TOPIC_RESET,
++        DATA_LOSS
++    }
++
++    /**
++     * @param previousTopicId the topic's UUID as last cached, or {@code null} if never observed
++     * @param currentTopicId  the topic's UUID as just fetched, or {@code null} if the fetch failed
++     */
++    public Decision classify(Uuid previousTopicId, Uuid currentTopicId) {
++        boolean bothKnownAndDifferent = previousTopicId != null
++                && currentTopicId != null
++                && !previousTopicId.equals(currentTopicId);
++
++        if (bothKnownAndDifferent) {
++            return Decision.TOPIC_RESET;
++        }
++        // Same ID, or either ID couldn't be established -- in every case where we can't
++        // positively prove this is a benign reset, treat it as data loss.
++        return Decision.DATA_LOSS;
++    }
++}
